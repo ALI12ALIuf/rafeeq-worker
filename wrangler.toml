@@ -1,0 +1,8 @@
+name = "rafeeq-api"
+main = "worker.js"
+compatibility_date = "2024-09-24"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "rafeeq-db"
+database_id = "f2994bcb-81ac-46f6-941c-fe57e58bc8e9"
