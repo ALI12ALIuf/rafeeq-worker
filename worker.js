@@ -1,5 +1,5 @@
 // ============================================================
-// رفيق API - المرحلة 5: Auth + Users + Posts + Friends + Messages
+// رفيق API - المرحلة 7: كل المراحل + Reports + Admin
 // ============================================================
 
 function jsonResponse(data, status = 200) {
@@ -49,12 +49,20 @@ async function verifyToken(request, env) {
     return user || null;
 }
 
+async function requireAdmin(request, env) {
+    const user = await verifyToken(request, env);
+    if (!user) return null;
+    if (user.is_admin !== 1) return null;
+    return user;
+}
+
 function formatUser(user) {
     return {
         uid: user.uid, email: user.email, name: user.name,
         shareableId: user.shareable_id, avatarType: user.avatar_type,
         bio: user.bio, walletBalance: user.wallet_balance,
         isVerified: user.is_verified === 1, isBanned: user.is_banned === 1,
+        isAdmin: user.is_admin === 1,
         friendsCount: user.friends_count, createdAt: user.created_at,
         lastSeen: user.last_seen
     };
@@ -78,6 +86,16 @@ function formatMessage(m) {
         id: m.id, fromUid: m.from_uid, toUid: m.to_uid,
         package: m.package, isRead: m.is_read === 1,
         createdAt: m.created_at, expiresAt: m.expires_at
+    };
+}
+
+function formatReport(r) {
+    return {
+        id: r.id, reporterId: r.reporter_id,
+        targetId: r.target_id, targetType: r.target_type,
+        reason: r.reason, description: r.description,
+        status: r.status, createdAt: r.created_at,
+        resolvedAt: r.resolved_at, resolvedBy: r.resolved_by
     };
 }
 
@@ -132,6 +150,7 @@ export default {
                 
                 const user = await env.DB.prepare('SELECT * FROM users WHERE email = ?').bind(email).first();
                 if (!user) return jsonResponse({ error: 'الإيميل أو كلمة المرور غير صحيحة' }, 401);
+                if (user.is_banned === 1) return jsonResponse({ error: 'الحساب محظور' }, 403);
                 
                 await env.DB.prepare('UPDATE users SET last_seen = ? WHERE uid = ?').bind(now, user.uid).run();
                 
@@ -160,6 +179,7 @@ export default {
                     user = await env.DB.prepare('SELECT * FROM users WHERE uid = ?').bind(uid).first();
                     await env.DB.prepare(`UPDATE stats SET value = value + 1, updated_at = ? WHERE key = 'total_users'`).bind(now).run();
                 } else {
+                    if (user.is_banned === 1) return jsonResponse({ error: 'الحساب محظور' }, 403);
                     await env.DB.prepare('UPDATE users SET last_seen = ? WHERE uid = ?').bind(now, user.uid).run();
                 }
                 
@@ -463,7 +483,6 @@ export default {
             
             // ==================== MESSAGES ROUTES ====================
             
-            // 23. Get Conversations List
             if (path === '/api/messages/conversations' && method === 'GET') {
                 const user = await verifyToken(request, env);
                 if (!user) return jsonResponse({ error: 'غير مصرح' }, 401);
@@ -507,7 +526,6 @@ export default {
                 return jsonResponse({ success: true, conversations: conversationsWithUsers });
             }
             
-            // 24. Get Messages with Friend
             if (path.startsWith('/api/messages/') && method === 'GET' && !path.includes('/conversations') && !path.includes('/mark-read')) {
                 const friendId = path.replace('/api/messages/', '');
                 const user = await verifyToken(request, env);
@@ -531,7 +549,6 @@ export default {
                 });
             }
             
-            // 25. Send Message
             if (path === '/api/messages' && method === 'POST') {
                 const user = await verifyToken(request, env);
                 if (!user) return jsonResponse({ error: 'غير مصرح' }, 401);
@@ -560,7 +577,6 @@ export default {
                 return jsonResponse({ success: true, messageId: messageId, message: 'تم إرسال الرسالة' });
             }
             
-            // 26. Mark Messages as Read
             if (path === '/api/messages/mark-read' && method === 'POST') {
                 const user = await verifyToken(request, env);
                 if (!user) return jsonResponse({ error: 'غير مصرح' }, 401);
@@ -575,7 +591,6 @@ export default {
                 return jsonResponse({ success: true, updatedCount: result.meta?.changes || 0 });
             }
             
-            // 27. Delete Message
             if (path.startsWith('/api/messages/') && method === 'DELETE') {
                 const messageId = path.replace('/api/messages/', '');
                 const user = await verifyToken(request, env);
@@ -590,6 +605,219 @@ export default {
                 
                 await env.DB.prepare('DELETE FROM messages WHERE id = ?').bind(messageId).run();
                 return jsonResponse({ success: true, message: 'تم حذف الرسالة' });
+            }
+            
+            // ==================== REPORTS ROUTES ====================
+            
+            // 28. Submit Report
+            if (path === '/api/reports' && method === 'POST') {
+                const user = await verifyToken(request, env);
+                if (!user) return jsonResponse({ error: 'غير مصرح' }, 401);
+                
+                const { targetId, targetType, reason, description } = await request.json();
+                
+                if (!targetId || !targetType || !reason) {
+                    return jsonResponse({ error: 'targetId و targetType و reason مطلوبة' }, 400);
+                }
+                
+                if (!['user', 'post', 'message'].includes(targetType)) {
+                    return jsonResponse({ error: 'targetType غير صحيح' }, 400);
+                }
+                
+                const reportId = generateToken();
+                await env.DB.prepare(
+                    `INSERT INTO reports (id, reporter_id, target_id, target_type, reason, description, status, created_at)
+                     VALUES (?, ?, ?, ?, ?, ?, 'pending', ?)`
+                ).bind(reportId, user.uid, targetId, targetType, reason, description || '', now).run();
+                
+                await env.DB.prepare(
+                    `INSERT OR IGNORE INTO stats (key, value) VALUES ('total_reports', 0)`
+                ).run();
+                await env.DB.prepare(
+                    `UPDATE stats SET value = value + 1, updated_at = ? WHERE key = 'total_reports'`
+                ).bind(now).run();
+                
+                return jsonResponse({
+                    success: true,
+                    reportId: reportId,
+                    message: 'تم إرسال البلاغ'
+                });
+            }
+            
+            // 29. Get Reports (Admin)
+            if (path === '/api/reports' && method === 'GET') {
+                const admin = await requireAdmin(request, env);
+                if (!admin) return jsonResponse({ error: 'غير مصرح — للأدمن فقط' }, 403);
+                
+                const status = url.searchParams.get('status') || 'pending';
+                const limit = Math.min(parseInt(url.searchParams.get('limit')) || 30, 100);
+                const offset = parseInt(url.searchParams.get('offset')) || 0;
+                
+                const reports = await env.DB.prepare(
+                    `SELECT * FROM reports WHERE status = ? ORDER BY created_at DESC LIMIT ? OFFSET ?`
+                ).bind(status, limit, offset).all();
+                
+                return jsonResponse({
+                    success: true,
+                    reports: reports.results.map(formatReport)
+                });
+            }
+            
+            // 30. Resolve Report (Admin)
+            if (path.startsWith('/api/reports/resolve/') && method === 'POST') {
+                const reportId = path.replace('/api/reports/resolve/', '');
+                const admin = await requireAdmin(request, env);
+                if (!admin) return jsonResponse({ error: 'غير مصرح — للأدمن فقط' }, 403);
+                
+                const { status } = await request.json();
+                if (!['resolved', 'rejected'].includes(status)) {
+                    return jsonResponse({ error: 'status يجب أن يكون resolved أو rejected' }, 400);
+                }
+                
+                await env.DB.prepare(
+                    `UPDATE reports SET status = ?, resolved_at = ?, resolved_by = ? WHERE id = ?`
+                ).bind(status, now, admin.uid, reportId).run();
+                
+                return jsonResponse({ success: true, message: 'تم تحديث البلاغ' });
+            }
+            
+            // ==================== ADMIN ROUTES ====================
+            
+            // 31. Get Stats
+            if (path === '/api/admin/stats' && method === 'GET') {
+                const admin = await requireAdmin(request, env);
+                if (!admin) return jsonResponse({ error: 'غير مصرح — للأدمن فقط' }, 403);
+                
+                const totalUsers = await env.DB.prepare('SELECT COUNT(*) as c FROM users').first();
+                const totalPosts = await env.DB.prepare('SELECT COUNT(*) as c FROM posts').first();
+                const totalReports = await env.DB.prepare('SELECT COUNT(*) as c FROM reports').first();
+                const pendingReports = await env.DB.prepare('SELECT COUNT(*) as c FROM reports WHERE status = ?').bind('pending').first();
+                const totalMessages = await env.DB.prepare('SELECT COUNT(*) as c FROM messages').first();
+                const totalJobs = await env.DB.prepare('SELECT COUNT(*) as c FROM posts WHERE type = ?').bind('job').first();
+                const totalMarriage = await env.DB.prepare('SELECT COUNT(*) as c FROM posts WHERE type = ?').bind('marriage').first();
+                const bannedUsers = await env.DB.prepare('SELECT COUNT(*) as c FROM users WHERE is_banned = 1').first();
+                const verifiedUsers = await env.DB.prepare('SELECT COUNT(*) as c FROM users WHERE is_verified = 1').first();
+                
+                const last24h = await env.DB.prepare('SELECT COUNT(*) as c FROM users WHERE created_at > ?').bind(now - 86400).first();
+                
+                return jsonResponse({
+                    success: true,
+                    stats: {
+                        totalUsers: totalUsers.c,
+                        totalPosts: totalPosts.c,
+                        totalJobs: totalJobs.c,
+                        totalMarriage: totalMarriage.c,
+                        totalMessages: totalMessages.c,
+                        totalReports: totalReports.c,
+                        pendingReports: pendingReports.c,
+                        bannedUsers: bannedUsers.c,
+                        verifiedUsers: verifiedUsers.c,
+                        newUsers24h: last24h.c
+                    }
+                });
+            }
+            
+            // 32. List Users (Admin)
+            if (path === '/api/admin/users' && method === 'GET') {
+                const admin = await requireAdmin(request, env);
+                if (!admin) return jsonResponse({ error: 'غير مصرح — للأدمن فقط' }, 403);
+                
+                const limit = Math.min(parseInt(url.searchParams.get('limit')) || 50, 100);
+                const offset = parseInt(url.searchParams.get('offset')) || 0;
+                const search = url.searchParams.get('search') || '';
+                
+                let query = 'SELECT * FROM users';
+                const params = [];
+                
+                if (search) {
+                    query += ' WHERE name LIKE ? OR shareable_id LIKE ? OR email LIKE ?';
+                    params.push(`%${search}%`, `%${search}%`, `%${search}%`);
+                }
+                
+                query += ' ORDER BY created_at DESC LIMIT ? OFFSET ?';
+                params.push(limit, offset);
+                
+                const users = await env.DB.prepare(query).bind(...params).all();
+                
+                return jsonResponse({
+                    success: true,
+                    users: users.results.map(formatUser)
+                });
+            }
+            
+            // 33. Ban User (Admin)
+            if (path.startsWith('/api/admin/users/') && path.endsWith('/ban') && method === 'POST') {
+                const uid = path.replace('/api/admin/users/', '').replace('/ban', '');
+                const admin = await requireAdmin(request, env);
+                if (!admin) return jsonResponse({ error: 'غير مصرح — للأدمن فقط' }, 403);
+                
+                if (uid === admin.uid) return jsonResponse({ error: 'لا يمكنك حظر نفسك' }, 400);
+                
+                await env.DB.prepare('UPDATE users SET is_banned = 1 WHERE uid = ?').bind(uid).run();
+                await env.DB.prepare('DELETE FROM sessions WHERE user_uid = ?').bind(uid).run();
+                
+                return jsonResponse({ success: true, message: 'تم حظر المستخدم' });
+            }
+            
+            // 34. Unban User (Admin)
+            if (path.startsWith('/api/admin/users/') && path.endsWith('/unban') && method === 'POST') {
+                const uid = path.replace('/api/admin/users/', '').replace('/unban', '');
+                const admin = await requireAdmin(request, env);
+                if (!admin) return jsonResponse({ error: 'غير مصرح — للأدمن فقط' }, 403);
+                
+                await env.DB.prepare('UPDATE users SET is_banned = 0 WHERE uid = ?').bind(uid).run();
+                
+                return jsonResponse({ success: true, message: 'تم إلغاء الحظر' });
+            }
+            
+            // 35. Verify User (Admin)
+            if (path.startsWith('/api/admin/verify/') && method === 'POST') {
+                const uid = path.replace('/api/admin/verify/', '');
+                const admin = await requireAdmin(request, env);
+                if (!admin) return jsonResponse({ error: 'غير مصرح — للأدمن فقط' }, 403);
+                
+                const { verified } = await request.json();
+                
+                await env.DB.prepare('UPDATE users SET is_verified = ? WHERE uid = ?').bind(verified ? 1 : 0, uid).run();
+                
+                return jsonResponse({ success: true, message: verified ? 'تم توثيق المستخدم' : 'تم إلغاء التوثيق' });
+            }
+            
+            // 36. Manage Wallet (Admin)
+            if (path === '/api/admin/wallet' && method === 'POST') {
+                const admin = await requireAdmin(request, env);
+                if (!admin) return jsonResponse({ error: 'غير مصرح — للأدمن فقط' }, 403);
+                
+                const { userId, amount, reason } = await request.json();
+                
+                if (!userId || amount === undefined || !reason) {
+                    return jsonResponse({ error: 'userId و amount و reason مطلوبة' }, 400);
+                }
+                
+                if (typeof amount !== 'number' || amount === 0) {
+                    return jsonResponse({ error: 'amount يجب أن يكون رقماً غير صفري' }, 400);
+                }
+                
+                const target = await env.DB.prepare('SELECT uid, wallet_balance FROM users WHERE uid = ?').bind(userId).first();
+                if (!target) return jsonResponse({ error: 'المستخدم غير موجود' }, 404);
+                
+                const newBalance = (target.wallet_balance || 0) + amount;
+                if (newBalance < 0) return jsonResponse({ error: 'الرصيد غير كافٍ' }, 400);
+                
+                await env.DB.prepare('UPDATE users SET wallet_balance = ? WHERE uid = ?').bind(newBalance, userId).run();
+                
+                const txId = generateToken();
+                await env.DB.prepare(
+                    `INSERT INTO transactions (id, user_id, amount, type, reason, by_uid, created_at)
+                     VALUES (?, ?, ?, ?, ?, ?, ?)`
+                ).bind(txId, userId, amount, amount > 0 ? 'credit' : 'debit', reason, admin.uid, now).run();
+                
+                return jsonResponse({
+                    success: true,
+                    newBalance: newBalance,
+                    transactionId: txId,
+                    message: amount > 0 ? 'تم إضافة الرصيد' : 'تم خصم الرصيد'
+                });
             }
             
             // ==================== DEFAULT ====================
@@ -608,7 +836,14 @@ export default {
                     'POST /api/friends/reject/:id', 'DELETE /api/friends/:uid',
                     'GET  /api/messages/conversations', 'GET  /api/messages/:friendId',
                     'POST /api/messages', 'POST /api/messages/mark-read',
-                    'DELETE /api/messages/:id'
+                    'DELETE /api/messages/:id',
+                    'POST /api/reports', 'GET  /api/reports',
+                    'POST /api/reports/resolve/:id',
+                    'GET  /api/admin/stats', 'GET  /api/admin/users',
+                    'POST /api/admin/users/:uid/ban',
+                    'POST /api/admin/users/:uid/unban',
+                    'POST /api/admin/verify/:uid',
+                    'POST /api/admin/wallet'
                 ]
             });
             
