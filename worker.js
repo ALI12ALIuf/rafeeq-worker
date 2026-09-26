@@ -1,5 +1,5 @@
 // ============================================================
-// رفيق API - المرحلة 4: Auth + Users + Posts + Friends
+// رفيق API - المرحلة 5: Auth + Users + Posts + Friends + Messages
 // ============================================================
 
 function jsonResponse(data, status = 200) {
@@ -51,43 +51,33 @@ async function verifyToken(request, env) {
 
 function formatUser(user) {
     return {
-        uid: user.uid,
-        email: user.email,
-        name: user.name,
-        shareableId: user.shareable_id,
-        avatarType: user.avatar_type,
-        bio: user.bio,
-        walletBalance: user.wallet_balance,
-        isVerified: user.is_verified === 1,
-        isBanned: user.is_banned === 1,
-        friendsCount: user.friends_count,
-        createdAt: user.created_at,
+        uid: user.uid, email: user.email, name: user.name,
+        shareableId: user.shareable_id, avatarType: user.avatar_type,
+        bio: user.bio, walletBalance: user.wallet_balance,
+        isVerified: user.is_verified === 1, isBanned: user.is_banned === 1,
+        friendsCount: user.friends_count, createdAt: user.created_at,
         lastSeen: user.last_seen
     };
 }
 
 function formatPost(post) {
     return {
-        id: post.id,
-        type: post.type,
-        userId: post.user_id,
-        name: post.name,
-        age: post.age,
-        country: post.country,
-        countryCode: post.country_code,
-        category: post.category,
-        jobTitle: post.job_title,
-        bio: post.bio,
-        married: post.married,
-        children: post.children,
-        image: post.image,
-        contactMethod: post.contact_method,
-        contactValue: post.contact_value,
-        isPaid: post.is_paid === 1,
-        isPriority: post.is_priority === 1,
-        views: post.views,
-        clicks: post.clicks,
-        createdAt: post.created_at
+        id: post.id, type: post.type, userId: post.user_id,
+        name: post.name, age: post.age, country: post.country,
+        countryCode: post.country_code, category: post.category,
+        jobTitle: post.job_title, bio: post.bio, married: post.married,
+        children: post.children, image: post.image,
+        contactMethod: post.contact_method, contactValue: post.contact_value,
+        isPaid: post.is_paid === 1, isPriority: post.is_priority === 1,
+        views: post.views, clicks: post.clicks, createdAt: post.created_at
+    };
+}
+
+function formatMessage(m) {
+    return {
+        id: m.id, fromUid: m.from_uid, toUid: m.to_uid,
+        package: m.package, isRead: m.is_read === 1,
+        createdAt: m.created_at, expiresAt: m.expires_at
     };
 }
 
@@ -471,6 +461,137 @@ export default {
                 return jsonResponse({ success: true, message: 'تم حذف الصديق' });
             }
             
+            // ==================== MESSAGES ROUTES ====================
+            
+            // 23. Get Conversations List
+            if (path === '/api/messages/conversations' && method === 'GET') {
+                const user = await verifyToken(request, env);
+                if (!user) return jsonResponse({ error: 'غير مصرح' }, 401);
+                
+                const conversations = await env.DB.prepare(
+                    `SELECT 
+                        CASE WHEN from_uid = ? THEN to_uid ELSE from_uid END as friend_uid,
+                        MAX(created_at) as last_message_at,
+                        COUNT(*) as message_count
+                     FROM messages
+                     WHERE (from_uid = ? OR to_uid = ?) 
+                       AND (expires_at IS NULL OR expires_at > ?)
+                     GROUP BY friend_uid
+                     ORDER BY last_message_at DESC
+                     LIMIT 50`
+                ).bind(user.uid, user.uid, user.uid, now).all();
+                
+                const conversationsWithUsers = [];
+                for (const conv of conversations.results) {
+                    const friend = await env.DB.prepare(
+                        'SELECT uid, name, shareable_id, avatar_type FROM users WHERE uid = ?'
+                    ).bind(conv.friend_uid).first();
+                    
+                    if (friend) {
+                        const unread = await env.DB.prepare(
+                            'SELECT COUNT(*) as count FROM messages WHERE from_uid = ? AND to_uid = ? AND is_read = 0'
+                        ).bind(conv.friend_uid, user.uid).first();
+                        
+                        conversationsWithUsers.push({
+                            friendUid: conv.friend_uid,
+                            friendName: friend.name,
+                            friendShareableId: friend.shareable_id,
+                            friendAvatarType: friend.avatar_type,
+                            lastMessageAt: conv.last_message_at,
+                            messageCount: conv.message_count,
+                            unreadCount: unread?.count || 0
+                        });
+                    }
+                }
+                
+                return jsonResponse({ success: true, conversations: conversationsWithUsers });
+            }
+            
+            // 24. Get Messages with Friend
+            if (path.startsWith('/api/messages/') && method === 'GET' && !path.includes('/conversations') && !path.includes('/mark-read')) {
+                const friendId = path.replace('/api/messages/', '');
+                const user = await verifyToken(request, env);
+                if (!user) return jsonResponse({ error: 'غير مصرح' }, 401);
+                if (!friendId) return jsonResponse({ error: 'friendId مطلوب' }, 400);
+                
+                const limit = Math.min(parseInt(url.searchParams.get('limit')) || 50, 100);
+                const offset = parseInt(url.searchParams.get('offset')) || 0;
+                
+                const messages = await env.DB.prepare(
+                    `SELECT * FROM messages 
+                     WHERE ((from_uid = ? AND to_uid = ?) OR (from_uid = ? AND to_uid = ?))
+                       AND (expires_at IS NULL OR expires_at > ?)
+                     ORDER BY created_at DESC
+                     LIMIT ? OFFSET ?`
+                ).bind(user.uid, friendId, friendId, user.uid, now, limit, offset).all();
+                
+                return jsonResponse({
+                    success: true,
+                    messages: messages.results.map(formatMessage).reverse()
+                });
+            }
+            
+            // 25. Send Message
+            if (path === '/api/messages' && method === 'POST') {
+                const user = await verifyToken(request, env);
+                if (!user) return jsonResponse({ error: 'غير مصرح' }, 401);
+                
+                const { toUid, package: pkg } = await request.json();
+                if (!toUid || !pkg) return jsonResponse({ error: 'toUid و package مطلوبان' }, 400);
+                
+                const isFriend = await env.DB.prepare(
+                    'SELECT 1 FROM friends WHERE user_uid = ? AND friend_uid = ?'
+                ).bind(user.uid, toUid).first();
+                
+                if (!isFriend) return jsonResponse({ error: 'يمكنك المراسلة مع الأصدقاء فقط' }, 403);
+                
+                const target = await env.DB.prepare('SELECT uid FROM users WHERE uid = ?').bind(toUid).first();
+                if (!target) return jsonResponse({ error: 'المستخدم غير موجود' }, 404);
+                
+                const messageId = generateToken();
+                const expiresAt = now + (24 * 60 * 60);
+                
+                await env.DB.prepare(
+                    `INSERT INTO messages (id, from_uid, to_uid, package, is_read, created_at, expires_at) VALUES (?, ?, ?, ?, 0, ?, ?)`
+                ).bind(messageId, user.uid, toUid, pkg, now, expiresAt).run();
+                
+                await env.DB.prepare(`UPDATE stats SET value = value + 1, updated_at = ? WHERE key = 'total_messages'`).bind(now).run();
+                
+                return jsonResponse({ success: true, messageId: messageId, message: 'تم إرسال الرسالة' });
+            }
+            
+            // 26. Mark Messages as Read
+            if (path === '/api/messages/mark-read' && method === 'POST') {
+                const user = await verifyToken(request, env);
+                if (!user) return jsonResponse({ error: 'غير مصرح' }, 401);
+                
+                const { friendId } = await request.json();
+                if (!friendId) return jsonResponse({ error: 'friendId مطلوب' }, 400);
+                
+                const result = await env.DB.prepare(
+                    `UPDATE messages SET is_read = 1 WHERE from_uid = ? AND to_uid = ? AND is_read = 0`
+                ).bind(friendId, user.uid).run();
+                
+                return jsonResponse({ success: true, updatedCount: result.meta?.changes || 0 });
+            }
+            
+            // 27. Delete Message
+            if (path.startsWith('/api/messages/') && method === 'DELETE') {
+                const messageId = path.replace('/api/messages/', '');
+                const user = await verifyToken(request, env);
+                if (!user) return jsonResponse({ error: 'غير مصرح' }, 401);
+                
+                const message = await env.DB.prepare('SELECT * FROM messages WHERE id = ?').bind(messageId).first();
+                if (!message) return jsonResponse({ error: 'الرسالة غير موجودة' }, 404);
+                
+                if (message.from_uid !== user.uid && message.to_uid !== user.uid) {
+                    return jsonResponse({ error: 'لا يمكنك حذف هذه الرسالة' }, 403);
+                }
+                
+                await env.DB.prepare('DELETE FROM messages WHERE id = ?').bind(messageId).run();
+                return jsonResponse({ success: true, message: 'تم حذف الرسالة' });
+            }
+            
             // ==================== DEFAULT ====================
             return jsonResponse({
                 message: 'رفيق API',
@@ -484,7 +605,10 @@ export default {
                     'GET /api/posts/:id', 'DELETE /api/posts/:id', 'POST /api/posts/:id/view',
                     'POST /api/friends/request', 'GET /api/friends/requests',
                     'GET /api/friends/requests/sent', 'POST /api/friends/accept/:id',
-                    'POST /api/friends/reject/:id', 'DELETE /api/friends/:uid'
+                    'POST /api/friends/reject/:id', 'DELETE /api/friends/:uid',
+                    'GET  /api/messages/conversations', 'GET  /api/messages/:friendId',
+                    'POST /api/messages', 'POST /api/messages/mark-read',
+                    'DELETE /api/messages/:id'
                 ]
             });
             
